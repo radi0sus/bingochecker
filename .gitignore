@@ -67,7 +67,7 @@ Icon?
 *.log
 
 # Exportierte Ergebnisse
-*.txt
+# *.txt
 
 # Lokale Testbilder / Screenshots
 *.jpg

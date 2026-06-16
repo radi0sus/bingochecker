@@ -1,0 +1,11 @@
+customtkinter
+tkinterdnd2
+Pillow
+requests
+beautifulsoup4
+numpy
+
+pyobjc-core
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz
+pyobjc-framework-Vision
