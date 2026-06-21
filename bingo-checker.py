@@ -7,6 +7,7 @@ from bs4 import BeautifulSoup
 import re
 import threading
 import numpy as np
+from scipy import ndimage
 import tempfile
 import os
 import gc
@@ -570,82 +571,77 @@ class BingoCheckerApp(ctk.CTk):
         return img, "Fallback: ganzes Bild"
 
     def auto_find_grid_box(self, img):
+        """
+        Erkennt das 5x5-Zahlenfeld in zwei Schritten:
+
+        1. Den größten zusammenhängenden HELLEN Bereich im Foto finden
+           (Connected-Component-Analyse statt einfacher Zeilen-/Spalten-
+           summen). Das ist der weiße Los-Schein selbst, robust getrennt
+           von einem unruhigen Hintergrund (z.B. Bäume/Textur), weil echte
+           2D-Zusammenhängigkeit geprüft wird statt unabhängiger Zeilen-
+           und Spaltenhelligkeit (die bei texturiertem Hintergrund leicht
+           in die Irre führt).
+        2. Innerhalb dieses Bereichs den blauen BINGO-Kopf per Farbe finden
+           (deutlich mehr Blau als Rot/Grün) und dessen Unterkante als
+           obere Grenze des Zahlenfelds verwenden, damit der Header nie
+           mit ins Feld gerät.
+
+        Die Gitterlinien selbst eignen sich NICHT als verlässliches
+        Trennmerkmal für die exakten Zellgrenzen, da die fetten Ziffern
+        auf diesem Schein genauso dunkel/breit sind wie die Linien.
+        Darum bleibt die Aufteilung in 5x5 Zellen nach dem Crop weiterhin
+        gleichmäßig (siehe read_grid_with_macos_vision) – das passt gut,
+        sobald der Crop selbst sauber ist.
+        """
         small = img.copy()
-        max_w = 700
+        max_w = 900
         scale = min(max_w / small.width, 1.0)
         new_size = (int(small.width * scale), int(small.height * scale))
         small = small.resize(new_size, RESAMPLE)
 
-        gray = small.convert("L")
-        arr = np.array(gray)
+        gray = np.array(small.convert("L"))
+        bright = gray > 150
 
-        mask = arr > 165
+        # kleine dunkle Lücken (Ziffern, dünne Linien) innerhalb der Karte
+        # schließen, damit sie den Zusammenhang nicht unterbrechen
+        bright = ndimage.binary_closing(bright, structure=np.ones((9, 9)))
 
-        h, w = mask.shape
+        labeled, n = ndimage.label(bright)
 
-        col_sum = mask.sum(axis=0)
-        row_sum = mask.sum(axis=1)
-
-        col_thr = max(8, int(h * 0.08))
-        row_thr = max(8, int(w * 0.08))
-
-        cols = np.where(col_sum > col_thr)[0]
-        rows = np.where(row_sum > row_thr)[0]
-
-        if len(cols) == 0 or len(rows) == 0:
+        if n == 0:
             return None
 
-        def spans(indices):
-            result = []
-            start = indices[0]
-            prev = indices[0]
+        sizes = ndimage.sum(bright, labeled, range(1, n + 1))
+        biggest = int(np.argmax(sizes)) + 1
 
-            for x in indices[1:]:
-                if x == prev + 1:
-                    prev = x
-                else:
-                    result.append((start, prev))
-                    start = x
-                    prev = x
+        ys, xs = np.where(labeled == biggest)
 
-            result.append((start, prev))
-            return result
-
-        x_spans = spans(cols)
-        y_spans = spans(rows)
-
-        candidates = []
-
-        for xs in x_spans:
-            for ys in y_spans:
-                x1, x2 = xs
-                y1, y2 = ys
-
-                bw = x2 - x1
-                bh = y2 - y1
-
-                if bw < w * 0.18 or bh < h * 0.18:
-                    continue
-
-                aspect = bw / max(bh, 1)
-
-                if 0.65 <= aspect <= 1.45:
-                    area = bw * bh
-                    candidates.append((area, x1, y1, x2, y2))
-
-        if not candidates:
+        if len(xs) == 0 or len(ys) == 0:
             return None
 
-        candidates.sort(reverse=True)
-        _, x1, y1, x2, y2 = candidates[0]
+        cx1, cy1, cx2, cy2 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
 
-        pad_x = int((x2 - x1) * 0.02)
-        pad_y = int((y2 - y1) * 0.02)
+        if (cx2 - cx1) < small.width * 0.18 or (cy2 - cy1) < small.height * 0.18:
+            return None
 
-        x1 = max(0, x1 - pad_x)
-        y1 = max(0, y1 - pad_y)
-        x2 = min(w - 1, x2 + pad_x)
-        y2 = min(h - 1, y2 + pad_y)
+        # Innerhalb der gefundenen Karte: blauen Header abtrennen
+        card_rgb = np.array(small.convert("RGB"))[cy1:cy2, cx1:cx2].astype(np.float32)
+        ch, cw, _ = card_rgb.shape
+        r, g, b = card_rgb[..., 0], card_rgb[..., 1], card_rgb[..., 2]
+
+        blue_mask = (b > 90) & (b - r > 25) & (b - g > 15)
+        blue_rows = np.where(blue_mask.mean(axis=1) > 0.25)[0]
+
+        header_bottom = 0
+        top_blue = blue_rows[blue_rows < ch * 0.5] if len(blue_rows) else blue_rows
+
+        if len(top_blue) > 0:
+            header_bottom = int(top_blue.max()) + 1
+
+        y1 = cy1 + header_bottom
+        y2 = cy2
+        x1 = cx1
+        x2 = cx2
 
         inv = 1.0 / scale
 

@@ -4,6 +4,7 @@ Pillow
 requests
 beautifulsoup4
 numpy
+scipy
 
 pyobjc-core
 pyobjc-framework-Cocoa
