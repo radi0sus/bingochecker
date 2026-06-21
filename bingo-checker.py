@@ -3,7 +3,6 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk, ImageEnhance, ImageFilter, ImageOps, ImageDraw
 import requests
-from bs4 import BeautifulSoup
 import re
 import threading
 import numpy as np
@@ -11,7 +10,9 @@ from scipy import ndimage
 import tempfile
 import os
 import gc
+import time
 from urllib.parse import unquote
+from datetime import date, timedelta
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -64,38 +65,54 @@ class BingoCheckerApp(ctk.CTk):
 
         self.ocr_result = None
         self.drawn_numbers = set()
-        
+        self.draw_candidates = []
+        self.selected_draw_day = None
+
         self.draw_date = None
         self.draw_date_var = ctk.StringVar(value="Ziehung: noch nicht geladen")
+
+        self.draw_year_var = ctk.StringVar(value="")
+        self.draw_date_select_var = ctk.StringVar(value="")
+        self.draw_year_menu = None
+        self.draw_date_menu = None
 
         self.rotation_angle = 0
         self.crop_box = None
 
         self.processing = False
         self.process_lock = threading.Lock()
+        
+        self.loading_draw = False
 
         self.drawn_numbers_text = None
         self.crop_window = None
 
+        self.serial_var = ctk.StringVar(value="")
+        self.los_var = ctk.StringVar(value="")
+
         self.build_ui()
         self.status_var.set("Bereit")
+
+        # Optional: direkt beim Start letzte gültige Ziehung laden,
+        # damit Datum-Dropdowns und gezogene Zahlen sofort befüllt sind.
+        self.after(300, self.load_latest_draw_async)
 
     # -----------------------------
     # UI
     # -----------------------------
     def build_ui(self):
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=20, pady=10)
+        header.pack(fill="x", padx=20, pady=(1, 0))
 
         title = ctk.CTkLabel(
             header,
-            text="BINGO Checker",
+            text="BINGO! Checker",
             font=("Segoe UI", 24, "bold")
         )
         title.pack(side="left")
 
         main = ctk.CTkFrame(self, fg_color="transparent")
-        main.pack(fill="both", expand=True, padx=20, pady=10)
+        main.pack(fill="both", expand=True, padx=20, pady=(2, 8))
 
         left = ctk.CTkFrame(main, fg_color="transparent")
         left.pack(side="left", fill="both", expand=True, padx=(0, 10))
@@ -105,7 +122,7 @@ class BingoCheckerApp(ctk.CTk):
 
         # Linke Seite
         upload_frame = ctk.CTkFrame(left, fg_color="#F0F0F0", corner_radius=12)
-        upload_frame.pack(fill="both", expand=True, pady=10)
+        upload_frame.pack(fill="both", expand=True, pady=(0, 0))
 
         # Drop-Zone
         self.drop_zone = ctk.CTkFrame(
@@ -116,9 +133,9 @@ class BingoCheckerApp(ctk.CTk):
             corner_radius=14,
             height=115
         )
-        self.drop_zone.pack(fill="x", padx=25, pady=(25, 10))
+        self.drop_zone.pack(fill="x", padx=25, pady=(15, 8))
         self.drop_zone.pack_propagate(False)
-        
+
         self.drop_label = ctk.CTkLabel(
             self.drop_zone,
             text="Bild hier ablegen\noder hier klicken zum Auswählen",
@@ -135,7 +152,7 @@ class BingoCheckerApp(ctk.CTk):
         self.enable_drop_target(self.drop_label)
 
         rotate_frame = ctk.CTkFrame(upload_frame, fg_color="transparent")
-        rotate_frame.pack(pady=6)
+        rotate_frame.pack(pady=5)
 
         ctk.CTkButton(
             rotate_frame,
@@ -156,7 +173,7 @@ class BingoCheckerApp(ctk.CTk):
         ).pack(side="left", padx=5)
 
         crop_frame = ctk.CTkFrame(upload_frame, fg_color="transparent")
-        crop_frame.pack(pady=6)
+        crop_frame.pack(pady=5)
 
         ctk.CTkButton(
             crop_frame,
@@ -168,11 +185,11 @@ class BingoCheckerApp(ctk.CTk):
         ).pack(side="left", padx=5)
 
         self.image_label = ctk.CTkLabel(upload_frame, text="")
-        self.image_label.pack(pady=10)
+        self.image_label.pack(pady=8)
 
         # Rechte Seite
         result_frame = ctk.CTkFrame(right, fg_color="#F0F0F0", corner_radius=12)
-        result_frame.pack(fill="both", expand=True, pady=10)
+        result_frame.pack(fill="both", expand=True, pady=(0, 0))
 
         self.status_var = ctk.StringVar(value="Starte...")
 
@@ -182,29 +199,67 @@ class BingoCheckerApp(ctk.CTk):
             font=("Segoe UI", 12),
             text_color="#666"
         )
-        status_label.pack(anchor="w", padx=20, pady=(10, 5))
+        status_label.pack(anchor="w", padx=20, pady=(8, 4))
 
         self.progress = ctk.CTkProgressBar(
             result_frame,
             mode="determinate",
             progress_color="#007AFF"
         )
-        self.progress.pack(fill="x", padx=20, pady=5)
+        self.progress.pack(fill="x", padx=20, pady=4)
         self.progress.set(0)
 
-        self.grid_frame = ctk.CTkFrame(result_frame, fg_color="transparent")
-        self.grid_frame.pack(pady=18, fill="both", expand=True)
+        self.grid_frame = ctk.CTkFrame(
+            result_frame,
+            fg_color="transparent",
+            width=370,
+            height=310
+        )
+        self.grid_frame.pack(pady=(8, 4), fill="x", expand=False)
+        self.grid_frame.pack_propagate(False)
+        self.grid_frame.grid_propagate(False)
 
         drawn_frame = ctk.CTkFrame(result_frame, fg_color="transparent")
-        drawn_frame.pack(fill="x", padx=20, pady=(0, 8))
-        
+        drawn_frame.pack(fill="x", padx=20, pady=(0, 6))
+
+        # Ziehungsdatum auswählen
+        draw_select_frame = ctk.CTkFrame(drawn_frame, fg_color="transparent")
+        draw_select_frame.pack(fill="x", pady=(0, 6))
+
         ctk.CTkLabel(
-            drawn_frame,
-            textvariable=self.draw_date_var,
-            font=("Segoe UI", 12, "bold"),
-            text_color="#444"
-        ).pack(anchor="w", pady=(0, 4))
-        
+            draw_select_frame,
+            text="Ziehung:",
+            font=("Segoe UI", 12, "bold")
+        ).pack(side="left", padx=(0, 6))
+
+        current_year = date.today().year
+        year_values = [str(y) for y in range(current_year, 2011, -1)]
+
+        self.draw_year_menu = ctk.CTkOptionMenu(
+            draw_select_frame,
+            width=78,
+            values=year_values,
+            variable=self.draw_year_var,
+            command=self.on_draw_year_changed
+        )
+        self.draw_year_menu.pack(side="left", padx=(0, 6))
+
+        self.draw_date_menu = ctk.CTkOptionMenu(
+            draw_select_frame,
+            width=120,
+            values=[""],
+            variable=self.draw_date_select_var,
+            command=self.on_draw_date_changed
+        )
+        self.draw_date_menu.pack(side="left", padx=(0, 0))
+
+        #ctk.CTkLabel(
+        #    drawn_frame,
+        #    textvariable=self.draw_date_var,
+        #    font=("Segoe UI", 12, "bold"),
+        #    text_color="#444"
+        #).pack(anchor="w", pady=(0, 4)) 
+
         ctk.CTkLabel(
             drawn_frame,
             text="Gezogene Zahlen:",
@@ -213,7 +268,7 @@ class BingoCheckerApp(ctk.CTk):
 
         self.drawn_numbers_text = ctk.CTkTextbox(
             drawn_frame,
-            height=70,
+            height=58,
             font=("Segoe UI", 12),
             wrap="word"
         )
@@ -221,8 +276,62 @@ class BingoCheckerApp(ctk.CTk):
         self.drawn_numbers_text.insert("1.0", "Noch nicht geladen")
         self.drawn_numbers_text.configure(state="disabled")
 
+        # Seriennummer / Losnummer manuell eingeben
+        number_only_vcmd = (self.register(self.validate_number_only), "%P")
+
+        ticket_frame = ctk.CTkFrame(result_frame, fg_color="transparent")
+        ticket_frame.pack(fill="x", padx=20, pady=(0, 6))
+
+        ctk.CTkLabel(
+            ticket_frame,
+            text="Serien-/Losnummer:",
+            font=("Segoe UI", 12, "bold")
+        ).pack(anchor="w", pady=(0, 4))
+
+        ticket_inputs = ctk.CTkFrame(ticket_frame, fg_color="transparent")
+        ticket_inputs.pack(fill="x")
+
+        ctk.CTkLabel(
+            ticket_inputs,
+            text="Serie",
+            font=("Segoe UI", 11)
+        ).pack(side="left", padx=(0, 4))
+
+        self.serial_entry = ctk.CTkEntry(
+            ticket_inputs,
+            width=80,
+            textvariable=self.serial_var,
+            validate="key",
+            validatecommand=number_only_vcmd
+        )
+        self.serial_entry.pack(side="left", padx=(0, 8))
+
+        ctk.CTkLabel(
+            ticket_inputs,
+            text="Los",
+            font=("Segoe UI", 11)
+        ).pack(side="left", padx=(0, 4))
+
+        self.los_entry = ctk.CTkEntry(
+            ticket_inputs,
+            width=90,
+            textvariable=self.los_var,
+            validate="key",
+            validatecommand=number_only_vcmd
+        )
+        self.los_entry.pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            ticket_inputs,
+            text="Prüfen",
+            width=70,
+            command=self.check_serial_los,
+            fg_color="#007AFF",
+            hover_color="#0056b3"
+        ).pack(side="left")
+
         actions = ctk.CTkFrame(result_frame, fg_color="transparent")
-        actions.pack(fill="x", padx=20, pady=10)
+        actions.pack(fill="x", padx=20, pady=(4, 8))
 
         ctk.CTkButton(
             actions,
@@ -230,7 +339,15 @@ class BingoCheckerApp(ctk.CTk):
             command=self.open_drawn_numbers_editor,
             fg_color="#34C759",
             hover_color="#248A3D"
-        ).pack(side="left", padx=5)
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            actions,
+            text="Kopieren",
+            command=self.copy_card_numbers,
+            fg_color="#007AFF",
+            hover_color="#0056b3"
+        ).pack(side="left", padx=4)
 
         ctk.CTkButton(
             actions,
@@ -238,18 +355,18 @@ class BingoCheckerApp(ctk.CTk):
             command=self.export_result,
             fg_color="#777",
             hover_color="#555"
-        ).pack(side="left", padx=5)
+        ).pack(side="left", padx=4)
 
     def enable_drop_target(self, widget):
         if DND_FILES is None or TkinterDnD is None:
             return
-    
+
         try:
             self.tk.call("tkdnd::drop_target", "register", widget._w, DND_FILES)
-    
+
             drop_command = self.register(self.handle_drop_data)
             self.tk.call("bind", widget._w, "<<Drop>>", f"{drop_command} %D")
-    
+
         except Exception:
             pass
 
@@ -277,9 +394,9 @@ class BingoCheckerApp(ctk.CTk):
         self.rotation_angle = 0
         self.crop_box = None
         self.ocr_result = None
-        self.drawn_numbers = set()
-        self.draw_date = None
-        self.draw_date_var.set("Ziehung: noch nicht geladen")
+
+        self.serial_var.set("")
+        self.los_var.set("")
 
         self.show_preview()
         self.start_process()
@@ -287,19 +404,19 @@ class BingoCheckerApp(ctk.CTk):
     def handle_drop_data(self, data):
         try:
             files = self.tk.splitlist(data)
-    
+
             if not files:
                 return
-    
+
             path = files[0]
-    
+
             if path.startswith("file://"):
                 path = unquote(path.replace("file://", ""))
-    
+
             path = path.strip("{}")
-    
+
             self.load_selected_image_path(path)
-    
+
         except Exception as e:
             messagebox.showerror("Fehler", f"Drag & Drop fehlgeschlagen:\n{e}")
 
@@ -371,7 +488,7 @@ class BingoCheckerApp(ctk.CTk):
             self.crop_window.lift()
             self.crop_window.focus_force()
             return
-    
+
         if not self.image_path:
             messagebox.showwarning("Fehler", "Bitte zuerst ein Bild auswählen.")
             return
@@ -397,7 +514,7 @@ class BingoCheckerApp(ctk.CTk):
         def on_close():
             self.crop_window = None
             top.destroy()
-        
+
         top.protocol("WM_DELETE_WINDOW", on_close)
 
         info = ctk.CTkLabel(
@@ -530,18 +647,22 @@ class BingoCheckerApp(ctk.CTk):
                 numbers = self.read_grid_with_macos_vision(img)
                 del img
 
-                drawn, draw_date = self.fetch_drawn_numbers()
+                # Falls beim Start noch keine Ziehung geladen wurde,
+                # wird automatisch die letzte gültige API-Ziehung geholt.
+                if not self.drawn_numbers or len(self.drawn_numbers) != 22:
+                    drawn, draw_date = self.fetch_drawn_numbers()
 
-                if not drawn:
-                    raise RuntimeError("Offizielle Gewinnzahlen konnten nicht geladen werden.")
+                    if not drawn:
+                        raise RuntimeError("Offizielle Gewinnzahlen konnten nicht geladen werden.")
+
+                    self.drawn_numbers = drawn
+                    self.draw_date = draw_date
 
                 hits = []
                 for row in numbers:
-                    hits.append([n in drawn for n in row])
+                    hits.append([n in self.drawn_numbers for n in row])
 
                 self.ocr_result = numbers
-                self.drawn_numbers = drawn
-                self.draw_date = draw_date
 
                 self.after(0, lambda: self.render_result(hits))
 
@@ -571,28 +692,6 @@ class BingoCheckerApp(ctk.CTk):
         return img, "Fallback: ganzes Bild"
 
     def auto_find_grid_box(self, img):
-        """
-        Erkennt das 5x5-Zahlenfeld in zwei Schritten:
-
-        1. Den größten zusammenhängenden HELLEN Bereich im Foto finden
-           (Connected-Component-Analyse statt einfacher Zeilen-/Spalten-
-           summen). Das ist der weiße Los-Schein selbst, robust getrennt
-           von einem unruhigen Hintergrund (z.B. Bäume/Textur), weil echte
-           2D-Zusammenhängigkeit geprüft wird statt unabhängiger Zeilen-
-           und Spaltenhelligkeit (die bei texturiertem Hintergrund leicht
-           in die Irre führt).
-        2. Innerhalb dieses Bereichs den blauen BINGO-Kopf per Farbe finden
-           (deutlich mehr Blau als Rot/Grün) und dessen Unterkante als
-           obere Grenze des Zahlenfelds verwenden, damit der Header nie
-           mit ins Feld gerät.
-
-        Die Gitterlinien selbst eignen sich NICHT als verlässliches
-        Trennmerkmal für die exakten Zellgrenzen, da die fetten Ziffern
-        auf diesem Schein genauso dunkel/breit sind wie die Linien.
-        Darum bleibt die Aufteilung in 5x5 Zellen nach dem Crop weiterhin
-        gleichmäßig (siehe read_grid_with_macos_vision) – das passt gut,
-        sobald der Crop selbst sauber ist.
-        """
         small = img.copy()
         max_w = 900
         scale = min(max_w / small.width, 1.0)
@@ -602,8 +701,6 @@ class BingoCheckerApp(ctk.CTk):
         gray = np.array(small.convert("L"))
         bright = gray > 150
 
-        # kleine dunkle Lücken (Ziffern, dünne Linien) innerhalb der Karte
-        # schließen, damit sie den Zusammenhang nicht unterbrechen
         bright = ndimage.binary_closing(bright, structure=np.ones((9, 9)))
 
         labeled, n = ndimage.label(bright)
@@ -624,7 +721,6 @@ class BingoCheckerApp(ctk.CTk):
         if (cx2 - cx1) < small.width * 0.18 or (cy2 - cy1) < small.height * 0.18:
             return None
 
-        # Innerhalb der gefundenen Karte: blauen Header abtrennen
         card_rgb = np.array(small.convert("RGB"))[cy1:cy2, cx1:cx2].astype(np.float32)
         ch, cw, _ = card_rgb.shape
         r, g, b = card_rgb[..., 0], card_rgb[..., 1], card_rgb[..., 2]
@@ -749,15 +845,6 @@ class BingoCheckerApp(ctk.CTk):
             gc.collect()
 
     def preprocess_grid_for_vision(self, grid_img):
-        """
-        Verbesserte, aber vorsichtige Vorverarbeitung:
-        - keine Ränder hinzufügen
-        - keine harte Schwarz/Weiß-Binarisierung
-        - kleine Bilder hochskalieren
-        - Kontrast und Schärfe moderat verbessern
-        - etwas besser für graue Quittungen/Thermopapier
-        """
-
         img = grid_img.convert("L")
 
         w, h = img.size
@@ -801,7 +888,6 @@ class BingoCheckerApp(ctk.CTk):
 
         self.after(0, lambda: self.progress.set(0.35))
 
-        # Für Bingo-Zahlen immer Accurate verwenden
         result = self.macos_vision_ocr(proc, fast=False)
 
         self.after(0, lambda: self.progress.set(0.75))
@@ -859,116 +945,282 @@ class BingoCheckerApp(ctk.CTk):
         return numbers
 
     # -----------------------------
-    # Gewinnzahlen holen
+    # Gewinnzahlen per API holen
     # -----------------------------
-    def fetch_drawn_numbers(self):
-        url = "https://www.lotto-niedersachsen.de/bingo"
+    def last_sunday_on_or_before_today(self):
+        today = date.today()
+        days_since_sunday = (today.weekday() + 1) % 7
+        return today - timedelta(days=days_since_sunday)
 
-        def clean_draw_date(raw):
-            if not raw:
-                return None
+    def sunday_dates_for_year(self, year):
+        year = int(year)
 
-            text = re.sub(r"\s+", " ", raw).strip()
+        start = date(year, 1, 1)
+        end = date(year, 12, 31)
 
-            # Aus "Gewinnzahlen am Sonntag, 14.06.2026"
-            # wird "Sonntag, 14.06.2026"
-            text = re.sub(
-                r"^Gewinnzahlen\s+am\s+",
-                "",
-                text,
-                flags=re.IGNORECASE
-            ).strip()
+        today = date.today()
 
-            match = re.search(
-                r"(?:(Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag),\s*)?\d{1,2}\.\d{1,2}\.\d{4}",
-                text
+        if year == today.year:
+            end = today
+
+        min_date = date(2012, 1, 1)
+
+        first_sunday = start + timedelta(days=(6 - start.weekday()) % 7)
+
+        days = []
+        current = first_sunday
+
+        while current <= end:
+            if current >= min_date:
+                days.append(current)
+            current += timedelta(days=7)
+
+        days.reverse()
+        return days
+
+    def format_draw_day(self, draw_day):
+        return draw_day.strftime("%d.%m.%Y")
+
+    def parse_draw_day_from_ui(self):
+        raw = self.draw_date_select_var.get().strip()
+
+        match = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", raw)
+
+        if not match:
+            return None
+
+        return date(
+            int(match.group(3)),
+            int(match.group(2)),
+            int(match.group(1))
+        )
+
+    def on_draw_year_changed(self, year_text):
+        """
+        Jahr geändert:
+        Datumsliste mit allen Sonntagen dieses Jahres füllen.
+        Der automatisch ausgewählte erste Sonntag wird direkt geladen.
+        """
+        try:
+            days = self.sunday_dates_for_year(int(year_text))
+        except Exception:
+            days = []
+
+        values = [self.format_draw_day(d) for d in days]
+
+        if not values:
+            values = [""]
+
+        if self.draw_date_menu:
+            self.draw_date_menu.configure(values=values)
+
+        self.draw_date_select_var.set(values[0])
+
+        # Wenn durch den Jahrwechsel automatisch ein Datum ausgewählt wurde,
+        # diese Ziehung direkt laden.
+        if days:
+            self.load_draw_for_day_async(days[0])
+
+    def on_draw_date_changed(self, selected_text):
+        draw_day = self.parse_draw_day_from_ui()
+
+        if not draw_day:
+            return
+
+        self.load_draw_for_day_async(draw_day)
+
+    def set_draw_date_select_defaults(self, draw_day):
+        self.selected_draw_day = draw_day
+
+        year_text = str(draw_day.year)
+        self.draw_year_var.set(year_text)
+
+        days = self.sunday_dates_for_year(draw_day.year)
+        values = [self.format_draw_day(d) for d in days]
+
+        if not values:
+            values = [self.format_draw_day(draw_day)]
+
+        if self.draw_date_menu:
+            self.draw_date_menu.configure(values=values)
+
+        self.draw_date_select_var.set(self.format_draw_day(draw_day))
+
+    def fetch_bingo_api_for_date(self, draw_day):
+        date_key = draw_day.strftime("%Y-%m-%d")
+        url = f"https://www.bingo-umweltlotterie.de/api/gewinnzahlen/{date_key}"
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+            ),
+            "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "de-DE,de;q=0.9",
+        }
+
+        response = requests.get(url, headers=headers, timeout=10)
+
+        if response.status_code == 404:
+            return None
+
+        response.raise_for_status()
+
+        data = response.json()
+        bingo = data.get("bingo")
+
+        if not bingo:
+            raise ValueError(f"Keine BINGO-Daten in API-Antwort für {date_key} gefunden.")
+
+        raw_numbers = bingo.get("drawNumbersCollection") or []
+        ordered_numbers = []
+
+        for item in raw_numbers:
+            try:
+                idx = int(item.get("index"))
+                number = int(item.get("drawNumber"))
+            except (TypeError, ValueError):
+                continue
+
+            if 1 <= number <= 75:
+                ordered_numbers.append((idx, number))
+
+        ordered_numbers.sort(key=lambda x: x[0])
+        numbers = [number for _, number in ordered_numbers]
+
+        if len(numbers) != 22:
+            raise ValueError(
+                f"API-Ziehung {date_key} enthält nicht genau 22 Zahlen, sondern {len(numbers)}."
             )
 
-            if match:
-                return match.group(0)
+        if len(set(numbers)) != 22:
+            raise ValueError(f"API-Ziehung {date_key} enthält doppelte Zahlen.")
 
-            return text or None
+        raw_candidates = bingo.get("candidatesCollection") or []
+        candidates = []
 
+        for item in raw_candidates:
+            try:
+                idx = int(item.get("index"))
+            except (TypeError, ValueError):
+                idx = 999
+
+            serial = item.get("serialNumber")
+            ticket = item.get("ticket")
+
+            candidates.append({
+                "index": idx,
+                "serialNumber": serial,
+                "ticket": ticket,
+            })
+
+        candidates.sort(key=lambda x: x["index"])
+
+        draw_date_text = f"Sonntag, {draw_day.strftime('%d.%m.%Y')}"
+
+        return set(numbers), draw_date_text, candidates
+
+    def fetch_drawn_numbers(self):
         try:
-            headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 Chrome/120 Safari/537.36"
-                ),
-                "Accept-Language": "de-DE,de;q=0.9",
-            }
+            self.draw_candidates = []
 
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
+            start_sunday = self.last_sunday_on_or_before_today()
 
-            soup = BeautifulSoup(response.text, "html.parser")
+            for i in range(20):
+                draw_day = start_sunday - timedelta(weeks=i)
 
-            candidates = []
+                result = self.fetch_bingo_api_for_date(draw_day)
 
-            # Über Bingo-Zahlencontainer laufen und die passende Datumszeile suchen
-            for numbers_container in soup.select(".bingo-draw-numbers"):
-                drawn = set()
+                if result is None:
+                    time.sleep(0.25)
+                    continue
 
-                balls = numbers_container.select(".draw-number-ball.default")
+                drawn, draw_date, candidates = result
 
-                for ball in balls:
-                    raw = ball.get("aria-label") or ball.get_text(strip=True)
+                self.draw_candidates = candidates
+                self.selected_draw_day = draw_day
 
-                    if raw and raw.isdigit():
-                        value = int(raw)
-                        if 1 <= value <= 75:
-                            drawn.add(value)
+                self.after(0, lambda d=draw_day: self.set_draw_date_select_defaults(d))
 
-                draw_date = None
+                return drawn, draw_date
 
-                # In deinem HTML liegt .draw-card__date-section direkt vor
-                # .draw-card__numbers-section.
-                numbers_section = numbers_container.find_parent(
-                    "div",
-                    class_="draw-card__numbers-section"
-                )
-
-                if numbers_section:
-                    date_section = numbers_section.find_previous_sibling(
-                        "div",
-                        class_="draw-card__date-section"
-                    )
-
-                    if date_section:
-                        date_line = date_section.select_one(".draw-card__date-line")
-                        if date_line:
-                            draw_date = clean_draw_date(
-                                date_line.get_text(" ", strip=True)
-                            )
-
-                # Fallback: Suche im übergeordneten Card-Bereich
-                if not draw_date:
-                    parent = numbers_container.find_parent()
-
-                    for _ in range(6):
-                        if not parent:
-                            break
-
-                        date_line = parent.select_one(".draw-card__date-line")
-
-                        if date_line:
-                            draw_date = clean_draw_date(
-                                date_line.get_text(" ", strip=True)
-                            )
-                            break
-
-                        parent = parent.find_parent()
-
-                if len(drawn) == 22:
-                    candidates.append((drawn, draw_date))
-
-            if candidates:
-                return candidates[0]
-
-            raise ValueError("Keine vollständige BINGO-Ziehung mit 22 Zahlen gefunden.")
+            raise ValueError("Keine verfügbare BINGO-Ziehung in den letzten 20 Wochen gefunden.")
 
         except Exception:
             return set(), None
+
+    def load_latest_draw_async(self):
+        def worker():
+            try:
+                drawn, draw_date = self.fetch_drawn_numbers()
+
+                if not drawn:
+                    return
+
+                self.drawn_numbers = drawn
+                self.draw_date = draw_date
+
+                def update_ui():
+                    self.update_drawn_numbers_display()
+                    self.status_var.set("Bereit")
+                    self.progress.set(0)
+
+                self.after(0, update_ui)
+
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def load_draw_for_day_async(self, draw_day):
+        if self.loading_draw:
+            return
+
+        if self.selected_draw_day == draw_day and self.drawn_numbers:
+            return
+
+        self.loading_draw = True
+
+        self.status_var.set("Ziehung wird geladen...")
+        self.progress.set(0.15)
+        self.update_idletasks()
+
+        def worker():
+            try:
+                result = self.fetch_bingo_api_for_date(draw_day)
+
+                if result is None:
+                    raise RuntimeError("Für dieses Datum wurde keine Ziehung gefunden.")
+
+                drawn, draw_date, candidates = result
+
+                self.drawn_numbers = drawn
+                self.draw_date = draw_date
+                self.draw_candidates = candidates
+                self.selected_draw_day = draw_day
+
+                def update_ui():
+                    self.update_drawn_numbers_display()
+
+                    if self.ocr_result:
+                        self.render_result(self.check_hits())
+                    else:
+                        self.status_var.set(f"Ziehung geladen: {draw_date}")
+                        self.progress.set(1.0)
+
+                self.after(0, update_ui)
+
+            except Exception as e:
+                err = str(e)
+
+                self.after(0, lambda: self.status_var.set("Ziehung konnte nicht geladen werden"))
+                self.after(0, lambda: self.progress.set(0))
+                self.after(0, lambda: messagebox.showerror("Fehler", err))
+
+            finally:
+                self.loading_draw = False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     # -----------------------------
     # Gezogene Zahlen anzeigen / simulieren
@@ -1050,8 +1302,9 @@ class BingoCheckerApp(ctk.CTk):
                 return
 
             self.drawn_numbers = drawn
+            self.draw_candidates = []
+            self.selected_draw_day = None
 
-            # Bei Simulation kein offizielles Ziehungsdatum anzeigen
             self.draw_date = None
             self.draw_date_var.set("Ziehung: manuell/simuliert")
 
@@ -1207,21 +1460,17 @@ class BingoCheckerApp(ctk.CTk):
     def count_bingos(self, hits):
         count = 0
 
-        # Zeilen
         for r in range(5):
             if all(hits[r]):
                 count += 1
 
-        # Spalten
         for c in range(5):
             if all(hits[r][c] for r in range(5)):
                 count += 1
 
-        # Diagonale links oben -> rechts unten
         if all(hits[i][i] for i in range(5)):
             count += 1
 
-        # Diagonale rechts oben -> links unten
         if all(hits[i][4 - i] for i in range(5)):
             count += 1
 
@@ -1238,29 +1487,26 @@ class BingoCheckerApp(ctk.CTk):
     def check_hits(self):
         if not self.ocr_result:
             return []
+
         return [[n in self.drawn_numbers for n in row] for row in self.ocr_result]
 
     def get_bingo_cells(self, hits):
         bingo_cells = set()
 
-        # Zeilen
         for r in range(5):
             if all(hits[r]):
                 for c in range(5):
                     bingo_cells.add((r, c))
 
-        # Spalten
         for c in range(5):
             if all(hits[r][c] for r in range(5)):
                 for r in range(5):
                     bingo_cells.add((r, c))
 
-        # Diagonale links oben -> rechts unten
         if all(hits[i][i] for i in range(5)):
             for i in range(5):
                 bingo_cells.add((i, i))
 
-        # Diagonale rechts oben -> links unten
         if all(hits[i][4 - i] for i in range(5)):
             for i in range(5):
                 bingo_cells.add((i, 4 - i))
@@ -1268,43 +1514,206 @@ class BingoCheckerApp(ctk.CTk):
         return bingo_cells
 
     # -----------------------------
+    # Kopieren / Serien-Los / Export-Helfer
+    # -----------------------------
+    def validate_number_only(self, value):
+        return value == "" or value.isdigit()
+
+    def check_serial_los(self):
+        serial_raw = self.serial_var.get().strip()
+        los_raw = self.los_var.get().strip()
+
+        if not serial_raw or not los_raw:
+            messagebox.showwarning(
+                "Fehler",
+                "Bitte Seriennummer und Losnummer eingeben."
+            )
+            return
+
+        if not self.draw_candidates:
+            messagebox.showwarning(
+                "Fehler",
+                "Für diese Ziehung sind keine Serien-/Losnummern geladen."
+            )
+            return
+
+        try:
+            serial = int(serial_raw)
+            los = int(los_raw)
+        except ValueError:
+            messagebox.showwarning(
+                "Fehler",
+                "Seriennummer und Losnummer dürfen nur Zahlen enthalten."
+            )
+            return
+
+        for candidate in self.draw_candidates:
+            try:
+                c_serial = int(candidate.get("serialNumber"))
+                c_los = int(candidate.get("ticket"))
+            except (TypeError, ValueError):
+                continue
+
+            if c_serial == serial and c_los == los:
+                index = candidate.get("index")
+
+                messagebox.showinfo(
+                    "Treffer",
+                    (
+                        "Serien-/Losnummer gefunden!\n\n"
+                        f"Serie: {serial}\n"
+                        f"Los: {los}\n"
+                        f"Position: {index}"
+                    )
+                )
+                return
+
+        loaded = []
+
+        for candidate in self.draw_candidates:
+            s = candidate.get("serialNumber")
+            l = candidate.get("ticket")
+            idx = candidate.get("index")
+
+            if s is not None and l is not None:
+                loaded.append(f"{idx}: {s}/{l}")
+
+        extra = ""
+
+        if loaded:
+            extra = "\n\nGeladene Serien-/Losnummern:\n" + "\n".join(loaded)
+
+        messagebox.showinfo(
+            "Kein Treffer",
+            (
+                "Keine Übereinstimmung mit den Serien-/Losnummern dieser Ziehung."
+                + extra
+            )
+        )
+
+    def copy_card_numbers(self):
+        if not self.ocr_result:
+            messagebox.showwarning("Fehler", "Keine Scheinzahlen zum Kopieren vorhanden.")
+            return
+
+        lines = ["BINGO_CARD"]
+
+        for row in self.ocr_result:
+            lines.append("\t".join(str(n) if n != 0 else "?" for n in row))
+
+        lines.append("END")
+
+        text = "\n".join(lines)
+
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.update_idletasks()
+
+        messagebox.showinfo("Kopiert", "Scheinzahlen wurden in die Zwischenablage kopiert.")
+
+    def parse_draw_date_for_history_export(self):
+        if not self.draw_date:
+            return None
+
+        match = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", self.draw_date)
+
+        if not match:
+            return None
+
+        day = int(match.group(1))
+        month = int(match.group(2))
+        year = int(match.group(3))
+
+        return day, month, year
+
+    def build_history_export_text(self):
+        if not self.drawn_numbers or len(self.drawn_numbers) != 22:
+            raise ValueError("Für den History-Export müssen genau 22 gezogene Zahlen vorhanden sein.")
+
+        date_parts = self.parse_draw_date_for_history_export()
+
+        if not date_parts:
+            raise ValueError(
+                "Für den History-Export wird ein gültiges Ziehungsdatum benötigt.\n"
+                "Bei simulierten Ziehungen ist kein offizielles Datum vorhanden."
+            )
+
+        day, month, year = date_parts
+
+        numbers = sorted(self.drawn_numbers)
+
+        serial = self.serial_var.get().strip()
+        los = self.los_var.get().strip()
+
+        header = [
+            "Tag",
+            "Monat",
+            "Jahr",
+        ]
+
+        for i in range(1, 23):
+            header.append(f"Zahl{i}")
+
+        header.extend([
+            "Serien-Nr.1",
+            "Los-Nr.1"
+        ])
+
+        row = [
+            str(day),
+            str(month),
+            str(year),
+        ]
+
+        row.extend(str(n) for n in numbers)
+        row.append(serial)
+        row.append(los)
+
+        return "\t".join(header) + "\n" + "\t".join(row) + "\n"
+
+    # -----------------------------
     # Export
     # -----------------------------
     def export_result(self):
-        if not self.ocr_result:
-            messagebox.showwarning("Fehler", "Kein Ergebnis zum Exportieren!")
+        if not self.drawn_numbers:
+            messagebox.showwarning("Fehler", "Keine gezogenen Zahlen zum Exportieren vorhanden.")
+            return
+
+        if len(self.drawn_numbers) != 22:
+            messagebox.showwarning(
+                "Fehler",
+                f"Es müssen genau 22 gezogene Zahlen vorhanden sein.\n"
+                f"Aktuell vorhanden: {len(self.drawn_numbers)}"
+            )
+            return
+
+        try:
+            export_text = self.build_history_export_text()
+        except Exception as e:
+            messagebox.showwarning("Export nicht möglich", str(e))
             return
 
         path = filedialog.asksaveasfilename(
-            title="Ergebnis speichern",
+            title="History-Export speichern",
             defaultextension=".txt",
             filetypes=[
                 ("Text-Datei", "*.txt"),
+                ("TSV-Datei", "*.tsv"),
                 ("Alle Dateien", "*.*")
             ]
         )
 
-        if path:
-            hits = self.check_hits()
+        if not path:
+            return
 
+        try:
             with open(path, "w", encoding="utf-8") as f:
-                f.write("BINGO Ergebnis\n")
-                f.write("=" * 40 + "\n\n")
-                
-                if self.draw_date:
-                    f.write(f"Ziehung: {self.draw_date}\n\n")
+                f.write(export_text)
 
-                f.write("Karte:\n")
-                for row in self.ocr_result:
-                    f.write(" ".join(f"{n:2}" if n != 0 else " ?" for n in row) + "\n")
+            messagebox.showinfo("Erfolg", f"History-Export gespeichert:\n{path}")
 
-                f.write("\nGezogene Zahlen:\n")
-                f.write(", ".join(map(str, sorted(self.drawn_numbers))) + "\n")
-
-                f.write(f"\nTreffer: {sum(sum(row) for row in hits)}\n")
-                f.write(f"Bingo: {self.check_bingo(hits)}\n")
-
-            messagebox.showinfo("Erfolg", f"Ergebnis gespeichert:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Export fehlgeschlagen:\n{e}")
 
 
 # -----------------------------

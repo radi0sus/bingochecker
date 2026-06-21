@@ -2,7 +2,6 @@ customtkinter
 tkinterdnd2
 Pillow
 requests
-beautifulsoup4
 numpy
 scipy
 
