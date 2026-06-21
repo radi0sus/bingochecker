@@ -63,6 +63,9 @@ class BingoCheckerApp(ctk.CTk):
 
         self.ocr_result = None
         self.drawn_numbers = set()
+        
+        self.draw_date = None
+        self.draw_date_var = ctk.StringVar(value="Ziehung: noch nicht geladen")
 
         self.rotation_angle = 0
         self.crop_box = None
@@ -193,7 +196,14 @@ class BingoCheckerApp(ctk.CTk):
 
         drawn_frame = ctk.CTkFrame(result_frame, fg_color="transparent")
         drawn_frame.pack(fill="x", padx=20, pady=(0, 8))
-
+        
+        ctk.CTkLabel(
+            drawn_frame,
+            textvariable=self.draw_date_var,
+            font=("Segoe UI", 12, "bold"),
+            text_color="#444"
+        ).pack(anchor="w", pady=(0, 4))
+        
         ctk.CTkLabel(
             drawn_frame,
             text="Gezogene Zahlen:",
@@ -267,6 +277,8 @@ class BingoCheckerApp(ctk.CTk):
         self.crop_box = None
         self.ocr_result = None
         self.drawn_numbers = set()
+        self.draw_date = None
+        self.draw_date_var.set("Ziehung: noch nicht geladen")
 
         self.show_preview()
         self.start_process()
@@ -517,7 +529,7 @@ class BingoCheckerApp(ctk.CTk):
                 numbers = self.read_grid_with_macos_vision(img)
                 del img
 
-                drawn = self.fetch_drawn_numbers()
+                drawn, draw_date = self.fetch_drawn_numbers()
 
                 if not drawn:
                     raise RuntimeError("Offizielle Gewinnzahlen konnten nicht geladen werden.")
@@ -528,6 +540,7 @@ class BingoCheckerApp(ctk.CTk):
 
                 self.ocr_result = numbers
                 self.drawn_numbers = drawn
+                self.draw_date = draw_date
 
                 self.after(0, lambda: self.render_result(hits))
 
@@ -855,6 +868,31 @@ class BingoCheckerApp(ctk.CTk):
     def fetch_drawn_numbers(self):
         url = "https://www.lotto-niedersachsen.de/bingo"
 
+        def clean_draw_date(raw):
+            if not raw:
+                return None
+
+            text = re.sub(r"\s+", " ", raw).strip()
+
+            # Aus "Gewinnzahlen am Sonntag, 14.06.2026"
+            # wird "Sonntag, 14.06.2026"
+            text = re.sub(
+                r"^Gewinnzahlen\s+am\s+",
+                "",
+                text,
+                flags=re.IGNORECASE
+            ).strip()
+
+            match = re.search(
+                r"(?:(Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag),\s*)?\d{1,2}\.\d{1,2}\.\d{4}",
+                text
+            )
+
+            if match:
+                return match.group(0)
+
+            return text or None
+
         try:
             headers = {
                 "User-Agent": (
@@ -869,27 +907,72 @@ class BingoCheckerApp(ctk.CTk):
 
             soup = BeautifulSoup(response.text, "html.parser")
 
-            balls = soup.select(".bingo-draw-numbers .draw-number-ball.default")
+            candidates = []
 
-            drawn = set()
+            # Über Bingo-Zahlencontainer laufen und die passende Datumszeile suchen
+            for numbers_container in soup.select(".bingo-draw-numbers"):
+                drawn = set()
 
-            for ball in balls:
-                raw = ball.get("aria-label") or ball.get_text(strip=True)
+                balls = numbers_container.select(".draw-number-ball.default")
 
-                if raw and raw.isdigit():
-                    value = int(raw)
-                    if 1 <= value <= 75:
-                        drawn.add(value)
+                for ball in balls:
+                    raw = ball.get("aria-label") or ball.get_text(strip=True)
 
-            if len(drawn) != 22:
-                raise ValueError(
-                    f"Erwartet 22 BINGO-Zahlen, gefunden: {len(drawn)} -> {sorted(drawn)}"
+                    if raw and raw.isdigit():
+                        value = int(raw)
+                        if 1 <= value <= 75:
+                            drawn.add(value)
+
+                draw_date = None
+
+                # In deinem HTML liegt .draw-card__date-section direkt vor
+                # .draw-card__numbers-section.
+                numbers_section = numbers_container.find_parent(
+                    "div",
+                    class_="draw-card__numbers-section"
                 )
 
-            return drawn
+                if numbers_section:
+                    date_section = numbers_section.find_previous_sibling(
+                        "div",
+                        class_="draw-card__date-section"
+                    )
+
+                    if date_section:
+                        date_line = date_section.select_one(".draw-card__date-line")
+                        if date_line:
+                            draw_date = clean_draw_date(
+                                date_line.get_text(" ", strip=True)
+                            )
+
+                # Fallback: Suche im übergeordneten Card-Bereich
+                if not draw_date:
+                    parent = numbers_container.find_parent()
+
+                    for _ in range(6):
+                        if not parent:
+                            break
+
+                        date_line = parent.select_one(".draw-card__date-line")
+
+                        if date_line:
+                            draw_date = clean_draw_date(
+                                date_line.get_text(" ", strip=True)
+                            )
+                            break
+
+                        parent = parent.find_parent()
+
+                if len(drawn) == 22:
+                    candidates.append((drawn, draw_date))
+
+            if candidates:
+                return candidates[0]
+
+            raise ValueError("Keine vollständige BINGO-Ziehung mit 22 Zahlen gefunden.")
 
         except Exception:
-            return set()
+            return set(), None
 
     # -----------------------------
     # Gezogene Zahlen anzeigen / simulieren
@@ -897,6 +980,13 @@ class BingoCheckerApp(ctk.CTk):
     def update_drawn_numbers_display(self):
         if not self.drawn_numbers_text:
             return
+
+        if self.draw_date:
+            self.draw_date_var.set(f"Ziehung: {self.draw_date}")
+        elif self.drawn_numbers:
+            self.draw_date_var.set("Ziehung: manuell/simuliert")
+        else:
+            self.draw_date_var.set("Ziehung: noch nicht geladen")
 
         if self.drawn_numbers:
             text = ", ".join(map(str, sorted(self.drawn_numbers)))
@@ -964,6 +1054,11 @@ class BingoCheckerApp(ctk.CTk):
                 return
 
             self.drawn_numbers = drawn
+
+            # Bei Simulation kein offizielles Ziehungsdatum anzeigen
+            self.draw_date = None
+            self.draw_date_var.set("Ziehung: manuell/simuliert")
+
             self.update_drawn_numbers_display()
 
             if self.ocr_result:
@@ -1110,7 +1205,8 @@ class BingoCheckerApp(ctk.CTk):
         hits_count = sum(sum(row) for row in hits)
         bingo = self.check_bingo(hits)
 
-        self.status_var.set(f"Treffer: {hits_count} | {bingo}")
+        date_part = f" | Ziehung: {self.draw_date}" if self.draw_date else ""
+        self.status_var.set(f"Treffer: {hits_count} | {bingo}{date_part}")
 
     def count_bingos(self, hits):
         count = 0
@@ -1198,6 +1294,9 @@ class BingoCheckerApp(ctk.CTk):
             with open(path, "w", encoding="utf-8") as f:
                 f.write("BINGO Ergebnis\n")
                 f.write("=" * 40 + "\n\n")
+                
+                if self.draw_date:
+                    f.write(f"Ziehung: {self.draw_date}\n\n")
 
                 f.write("Karte:\n")
                 for row in self.ocr_result:
